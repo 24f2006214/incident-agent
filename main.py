@@ -70,7 +70,9 @@ def response(value: Any, status: int = 200) -> JSONResponse:
 
 
 def public_state(state: dict[str, Any]) -> dict[str, Any]:
-    return {k: v for k, v in state.items() if not k.startswith("_") and k != "effectCandidates"}
+    out = {k: v for k, v in state.items() if not k.startswith("_") and k != "effectCandidates"}
+    out["approvals"] = [{k: v for k, v in item.items() if not k.startswith("_")} for item in out.get("approvals", [])]
+    return out
 
 
 def safe_request(body: dict[str, Any]) -> dict[str, Any]:
@@ -157,7 +159,7 @@ def ai_plan(body: dict[str, Any]) -> dict[str, Any] | None:
         return None
 
 
-def choose_plan(body: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+def choose_plan(body: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
     incident = body["incident"]
     lines = line_items(incident.get("transcript", ""))
     available = {x[0] for x in lines}
@@ -191,7 +193,7 @@ def choose_plan(body: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, An
         span_id = new_hex(8)
         refs = evidence[:1] or [lines[0][0]] if lines else []
         dispatches.append({"actionId": action_id, "callId": call_id, "phase": "diagnostic", "toolName": tool_name, "arguments": arguments if isinstance(arguments, dict) else {}, "evidence": refs, "attempt": 1, "traceparent": f"00-{trace_id}-{span_id}-01"})
-    return diagnosis, dispatches
+    return diagnosis, dispatches, (plan if isinstance(plan, dict) else {})
 
 
 def span(name: str, kind: int, trace_id: str, span_id: str, parent: str | None, attrs: dict[str, Any], status: int | None = None) -> dict[str, Any]:
@@ -205,17 +207,24 @@ def span(name: str, kind: int, trace_id: str, span_id: str, parent: str | None, 
 
 def make_trace(body: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
     run_id = state["runId"]; marker = body.get("publicMarker", "")
-    trace_id = (state.get("dispatches") or [{}])[0].get("traceparent", "00-" + new_hex(16) + "-" + new_hex(8) + "-01").split("-")[1]
-    server = new_hex(8); agent = new_hex(8)
-    spans = [span("POST /v2/incidents", 2, trace_id, server, None, {"ga5.run.id": run_id, "ga5.public.marker": marker}), span("invoke_agent", 1, trace_id, agent, server, {"ga5.run.id": run_id, "ga5.public.marker": marker})]
-    spans.append(span("chat incident-plan", 3, trace_id, new_hex(8), agent, {"ga5.run.id": run_id, "ga5.public.marker": marker, "gen_ai.operation.name": "chat", "gen_ai.request.model": AI_MODEL}))
-    tool_spans=[]
+    trace = state.setdefault("_trace", {"traceId": new_hex(16), "server": new_hex(8), "agent": new_hex(8), "model": new_hex(8)})
+    trace_id = trace["traceId"]
+    spans = [span("POST /v2/incidents", 2, trace_id, trace["server"], None, {"ga5.run.id": run_id, "ga5.public.marker": marker}), span("invoke_agent", 1, trace_id, trace["agent"], trace["server"], {"ga5.run.id": run_id, "ga5.public.marker": marker}), span("chat incident-plan", 3, trace_id, trace["model"], trace["agent"], {"ga5.run.id": run_id, "ga5.public.marker": marker, "gen_ai.operation.name": "chat", "gen_ai.request.model": AI_MODEL})]
+    logical_ids = {}
+    diagnostics = []
     for dispatch in state.get("actionLog", []):
-        logical = new_hex(8); client = dispatch.get("traceparent", "00-x-y-01").split("-")[2]
-        spans.append(span(f"execute_tool {dispatch['toolName']}", 1, trace_id, logical, agent, {"ga5.run.id": run_id, "ga5.public.marker": marker, "ga5.action.id": dispatch["actionId"], "gen_ai.tool.name": dispatch["toolName"], "gen_ai.tool.call.id": dispatch["callId"], "gen_ai.operation.name": "execute_tool"}))
+        logical = logical_ids.setdefault(dispatch["actionId"], new_hex(8))
+        if dispatch.get("phase") == "diagnostic": diagnostics.append(logical)
+        if not any(x.get("spanId") == logical for x in spans):
+            spans.append(span(f"execute_tool {dispatch['toolName']}", 1, trace_id, logical, trace["agent"], {"ga5.run.id": run_id, "ga5.public.marker": marker, "ga5.action.id": dispatch["actionId"], "gen_ai.tool.name": dispatch["toolName"], "gen_ai.tool.call.id": dispatch["callId"], "gen_ai.operation.name": "execute_tool"}))
+        client = dispatch.get("traceparent", "00-"+trace_id+"-"+new_hex(8)+"-01").split("-")[2]
         receipt = next((r for r in state.get("receiptLog", []) if r.get("actionId") == dispatch["actionId"] and r.get("attempt") == dispatch.get("attempt")), {})
-        tool_spans.append(span(f"POST tool/{dispatch['toolName']}", 3, trace_id, client, logical, {"ga5.run.id": run_id, "ga5.public.marker": marker, "ga5.action.id": dispatch["actionId"], "ga5.attempt": dispatch.get("attempt",1), "ga5.receipt.id": receipt.get("receiptId", ""), "ga5.receipt.nonce": receipt.get("nonce", ""), "http.request.method": "POST", "http.request.resend_count": dispatch.get("attempt",1)-1, "http.response.status_code": receipt.get("status", 0)} , 2 if receipt.get("status") not in (None, 200) else None))
-    spans.extend(tool_spans)
+        attrs={"ga5.run.id":run_id,"ga5.public.marker":marker,"ga5.action.id":dispatch["actionId"],"ga5.attempt":dispatch.get("attempt",1),"ga5.receipt.id":receipt.get("receiptId",""),"ga5.receipt.nonce":receipt.get("nonce",""),"http.request.method":"POST","http.request.resend_count":dispatch.get("attempt",1)-1,"http.response.status_code":receipt.get("status",0)}
+        spans.append(span(f"POST tool/{dispatch['toolName']}", 3, trace_id, client, logical, attrs, 2 if receipt.get("status") not in (None,200) else None))
+    if len(set(diagnostics)) > 1:
+        spans.append(span("incident.join", 1, trace_id, new_hex(8), trace["agent"], {"ga5.run.id":run_id,"ga5.public.marker":marker}))
+    if state.get("receiptLog") and any("approvalId" in r for r in state.get("receiptLog", [])):
+        r=next(r for r in state["receiptLog"] if "approvalId" in r); spans.append(span("approval_gate",1,trace_id,new_hex(8),trace["agent"],{"ga5.run.id":run_id,"ga5.public.marker":marker,"ga5.approval.id":r.get("approvalId"),"ga5.approval.nonce":r.get("nonce","")}))
     return {"resourceSpans": [{"scopeSpans": [{"spans": spans}]}]}
 
 
@@ -240,11 +249,16 @@ async def create_incident(request: Request):
                 if existing["request_hash"] != request_hash:
                     return response({"error": "run content conflict"}, 409)
                 return response(public_state(json.loads(existing["state_json"])))
-            diagnosis, dispatches = choose_plan(body)
+            diagnosis, dispatches, plan = choose_plan(body)
             policy = body.get("policy", {})
             catalog = body.get("toolCatalog", [])
             effect_names = [x.get("name") for x in catalog if isinstance(x, dict) and x.get("name") in policy.get("effectTools", [])]
-            state = {"runId": run_id, "status": "waiting", "diagnosis": diagnosis, "dispatches": dispatches, "approvals": [], "actionLog": list(dispatches), "receiptLog": [], "otlp": {"resourceSpans": []}, "_catalog": catalog, "_policy": policy, "_approvalRequired": policy.get("approvalRequiredFor", []), "effectCandidates": effect_names}
+            state = {"runId": run_id, "status": "waiting", "diagnosis": diagnosis, "dispatches": dispatches, "approvals": [], "actionLog": list(dispatches), "receiptLog": [], "otlp": {"resourceSpans": []}, "_catalog": catalog, "_policy": policy, "_approvalRequired": policy.get("approvalRequiredFor", []), "effectCandidates": effect_names, "_plan": plan}
+            trace_id = dispatches[0]["traceparent"].split("-")[1] if dispatches else new_hex(16)
+            state["_trace"] = {"traceId": trace_id, "server": new_hex(8), "agent": new_hex(8), "model": new_hex(8)}
+            for dispatch in state["dispatches"]:
+                dispatch["traceparent"] = "00-" + trace_id + "-" + dispatch["traceparent"].split("-")[2] + "-01"
+            state["actionLog"] = list(state["dispatches"])
             state["otlp"] = make_trace(body, state)
             t=now(); connection.execute("INSERT INTO runs VALUES (?, ?, ?, ?, ?, ?, ?)", (run_id, request_hash, json.dumps(safe_request(body)), json.dumps(state), state["status"], t, t)); connection.commit()
             return response(public_state(state))
@@ -290,22 +304,28 @@ async def receipts(run_id: str, request: Request):
                 elif action.get("phase") == "effect":
                     pass
                 else:
-                    effect=next((x for x in state.get("effectCandidates",[]) if x), None)
+                    plan = state.get("_plan", {})
+                    effect = plan.get("effectTool") if isinstance(plan, dict) else None
+                    effect_args = plan.get("effectArguments", {}) if isinstance(plan, dict) else {}
+                    if effect not in state.get("effectCandidates", []):
+                        effect = next((x for x in state.get("effectCandidates",[]) if x), None)
                     if not effect:
                         catalog=state.get("_catalog",[]); policy=state.get("_policy",{}); names=[x.get("name") for x in catalog if isinstance(x,dict)]
                         effect=next((x for x in (policy.get("effectTools",[]) if isinstance(policy,dict) else []) if x in names), None)
                     if effect:
                         required=state.get("_approvalRequired",[])
                         if effect in required and not state.get("approvals"):
-                            aid="approval_"+new_hex(8); action_id="act_"+new_hex(8); args={}; state["approvals"]=[{"approvalId":aid,"actionId":action_id,"toolName":effect,"argumentsDigest":digest(args)}]
+                            aid="approval_"+new_hex(8); action_id="act_"+new_hex(8); args=effect_args if isinstance(effect_args, dict) else {}; state["approvals"]=[{"approvalId":aid,"actionId":action_id,"toolName":effect,"argumentsDigest":digest(args),"_arguments":args}]
                         else:
-                            state["dispatches"].append({"actionId":"act_"+new_hex(8),"callId":"call_"+new_hex(8),"phase":"effect","toolName":effect,"arguments":{},"evidence":state["diagnosis"]["evidence"][:1],"attempt":1,"traceparent":"00-"+action["traceparent"].split("-")[1]+"-"+new_hex(8)+"-01"})
+                            state["dispatches"].append({"actionId":"act_"+new_hex(8),"callId":"call_"+new_hex(8),"phase":"effect","toolName":effect,"arguments":effect_args if isinstance(effect_args, dict) else {},"evidence":state["diagnosis"]["evidence"][:1],"attempt":1,"traceparent":"00-"+action["traceparent"].split("-")[1]+"-"+new_hex(8)+"-01"})
                             state["actionLog"].append(state["dispatches"][-1])
             for approval in body.get("approvals",[]) if isinstance(body.get("approvals"),list) else []:
                 pending_approval=next((x for x in state.get("approvals",[]) if x.get("approvalId")==approval.get("approvalId")),None)
                 if not pending_approval or approval.get("decision")!="approved": return response({"error":"approval mismatch"},409)
+                state["receiptLog"].append({"receiptId": receipt_id, "approvalId": pending_approval["approvalId"], "actionId": pending_approval["actionId"], "decision": approval.get("decision"), "nonce": approval.get("nonce")})
                 pending_approval["approvalNonce"]=approval.get("nonce"); state["approvals"]=[]
-                d={"actionId":pending_approval["actionId"],"callId":"call_"+new_hex(8),"phase":"effect","toolName":pending_approval["toolName"],"arguments":{},"approvalId":pending_approval["approvalId"],"approvalNonce":approval.get("nonce"),"evidence":state["diagnosis"]["evidence"][:1],"attempt":1,"traceparent":"00-"+new_hex(16)+"-"+new_hex(8)+"-01"}; state["dispatches"].append(d); state["actionLog"].append(d)
+                args=pending_approval.get("_arguments", {})
+                d={"actionId":pending_approval["actionId"],"callId":"call_"+new_hex(8),"phase":"effect","toolName":pending_approval["toolName"],"arguments":args,"approvalId":pending_approval["approvalId"],"approvalNonce":approval.get("nonce"),"evidence":state["diagnosis"]["evidence"][:1],"attempt":1,"traceparent":"00-"+state["actionLog"][0]["traceparent"].split("-")[1]+"-"+new_hex(8)+"-01"}; state["dispatches"].append(d); state["actionLog"].append(d)
             if not state["dispatches"] and not state["approvals"] and state["status"]=="waiting": state["status"]="completed"; state["chosenEffect"]=next((x.get("toolName") for x in state["actionLog"] if x.get("phase")=="effect"),None); state["suppressed"]=[]
             state["otlp"]={"resourceSpans":[{"scopeSpans":[{"spans":[]}]}]}
             state["otlp"]=make_trace(json.loads(row["safe_request_json"]),state)
